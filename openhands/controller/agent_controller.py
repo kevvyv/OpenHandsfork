@@ -35,7 +35,6 @@ from openhands.events.observation import (
     AgentStateChangedObservation,
     CmdOutputObservation,
     ErrorObservation,
-    FatalErrorObservation,
     Observation,
 )
 from openhands.events.serialization.event import truncate_content
@@ -123,13 +122,41 @@ class AgentController:
         await self.set_agent_state_to(AgentState.STOPPED)
         self.event_stream.unsubscribe(EventStreamSubscriber.AGENT_CONTROLLER)
 
+
+################### THE STUFF I EDITED #################
+
+    def _get_last_n_messages(self, n):
+    # Retrieve the last n messages from the history
+        messages = []
+        for event in reversed(self.state.history.events):
+            if isinstance(event, MessageAction) and event.source == EventSource.AGENT:
+                messages.append(event)
+                if len(messages) == n:
+                    break
+        return list(reversed(messages))
+
+    def _messages_have_same_meaning(self, messages):
+    # Construct the prompt
+        prompt = f"Do these messages generally mean the same thing?\n"
+        for i, msg in enumerate(messages):
+            prompt += f"{i+1}. {msg.content}\n"
+        prompt += "Answer 'Yes' or 'No'."
+
+    # Use the LLM to generate a response
+        response = self.agent.llm.generate_text(prompt)
+
+    # Check the response
+        return 'yes' in response.lower()
+
+
+
     def update_state_before_step(self):
         self.state.iteration += 1
         self.state.local_iteration += 1
 
     async def update_state_after_step(self):
-        # update metrics especially for cost. Use deepcopy to avoid it being modified by agent.reset()
-        self.state.local_metrics = copy.deepcopy(self.agent.llm.metrics)
+        # update metrics especially for cost
+        self.state.local_metrics = self.agent.llm.metrics
         if 'llm_completions' not in self.state.extra_data:
             self.state.extra_data['llm_completions'] = []
         self.state.extra_data['llm_completions'].extend(self.agent.llm.llm_completions)
@@ -140,12 +167,12 @@ class AgentController:
 
         This method should be called for a particular type of errors, which have:
         - a user-friendly message, which will be shown in the chat box. This should not be a raw exception message.
-        - an ErrorObservation that can be sent to the LLM by the user role, with the exception message, so it can self-correct next time.
+        - an ErrorObservation that can be sent to the LLM by the agent, with the exception message, so it can self-correct next time.
         """
         self.state.last_error = message
         if exception:
             self.state.last_error += f': {exception}'
-        self.event_stream.add_event(ErrorObservation(message), EventSource.USER)
+        self.event_stream.add_event(ErrorObservation(message), EventSource.AGENT)
 
     async def start_step_loop(self):
         """The main loop for the agent's step-by-step execution."""
@@ -175,8 +202,6 @@ class AgentController:
         Args:
             event (Event): The incoming event to process.
         """
-        if hasattr(event, 'hidden') and event.hidden:
-            return
         if isinstance(event, Action):
             await self._handle_action(event)
         elif isinstance(event, Observation):
@@ -230,11 +255,6 @@ class AgentController:
                 observation_to_print.content, self.agent.llm.config.max_message_chars
             )
         logger.info(observation_to_print, extra={'msg_type': 'OBSERVATION'})
-
-        # Merge with the metrics from the LLM - it will to synced to the controller's local metrics in update_state_after_step()
-        if observation.llm_metrics is not None:
-            self.agent.llm.metrics.merge(observation.llm_metrics)
-
         if self._pending_action and self._pending_action.id == observation.cause:
             self._pending_action = None
             if self.state.agent_state == AgentState.USER_CONFIRMED:
@@ -250,12 +270,6 @@ class AgentController:
         elif isinstance(observation, ErrorObservation):
             if self.state.agent_state == AgentState.ERROR:
                 self.state.metrics.merge(self.state.local_metrics)
-        elif isinstance(observation, FatalErrorObservation):
-            await self.report_error(
-                'There was a fatal error during agent execution: ' + str(observation)
-            )
-            await self.set_agent_state_to(AgentState.ERROR)
-            self.state.metrics.merge(self.state.local_metrics)
 
     async def _handle_message_action(self, action: MessageAction):
         """Handles message actions from the event stream.
@@ -393,7 +407,7 @@ class AgentController:
         await self.delegate.set_agent_state_to(AgentState.RUNNING)
 
     async def _step(self) -> None:
-        """Executes a single step of the parent or delegate agent. Detects stuck agents and limits on the number of iterations and the task budget."""
+        """Executes a single step of the agent. Detects stuck agents and limits on the number of iterations and the task budget."""
         if self.get_agent_state() != AgentState.RUNNING:
             await asyncio.sleep(1)
             return
@@ -415,7 +429,7 @@ class AgentController:
             extra={'msg_type': 'STEP'},
         )
 
-        # check if agent hit the resources limit
+        # Check if agent hit the resources limit
         stop_step = False
         if self.state.iteration >= self.state.max_iterations:
             stop_step = await self._handle_traffic_control(
@@ -437,14 +451,20 @@ class AgentController:
             if action is None:
                 raise LLMNoActionError('No action was returned')
         except (LLMMalformedActionError, LLMNoActionError, LLMResponseError) as e:
-            # report to the user
-            # and send the underlying exception to the LLM for self-correction
+            # Report to the user and send the underlying exception to the LLM for self-correction
             await self.report_error(str(e))
             return
 
+        # Insert the new logic here
+        last_three_messages = self._get_last_n_agent_messages(3)
+        if len(last_three_messages) == 3:
+            if await self._messages_have_same_meaning(last_three_messages):
+                # Replace action with "I don't know" message
+                action = MessageAction(content="I don't know", source=EventSource.AGENT)
+
         if action.runnable:
             if self.state.confirmation_mode and (
-                type(action) is CmdRunAction or type(action) is IPythonRunCellAction
+                isinstance(action, CmdRunAction) or isinstance(action, IPythonRunCellAction)
             ):
                 action.is_confirmed = ActionConfirmationStatus.AWAITING_CONFIRMATION
             self._pending_action = action
@@ -452,8 +472,7 @@ class AgentController:
         if not isinstance(action, NullAction):
             if (
                 hasattr(action, 'is_confirmed')
-                and action.is_confirmed
-                == ActionConfirmationStatus.AWAITING_CONFIRMATION
+                and action.is_confirmed == ActionConfirmationStatus.AWAITING_CONFIRMATION
             ):
                 await self.set_agent_state_to(AgentState.AWAITING_USER_CONFIRMATION)
             self.event_stream.add_event(action, EventSource.AGENT)
@@ -462,9 +481,9 @@ class AgentController:
         logger.info(action, extra={'msg_type': 'ACTION'})
 
         if self._is_stuck():
-            # This need to go BEFORE report_error to sync metrics
-            await self.set_agent_state_to(AgentState.ERROR)
             await self.report_error('Agent got stuck in a loop')
+            await self.set_agent_state_to(AgentState.ERROR)
+
 
     async def _delegate_step(self):
         """Executes a single step of the delegate agent."""
@@ -532,21 +551,20 @@ class AgentController:
         else:
             self.state.traffic_control_state = TrafficControlState.THROTTLING
             if self.headless_mode:
-                # This need to go BEFORE report_error to sync metrics
-                await self.set_agent_state_to(AgentState.ERROR)
                 # set to ERROR state if running in headless mode
                 # since user cannot resume on the web interface
                 await self.report_error(
                     f'Agent reached maximum {limit_type} in headless mode, task stopped. '
                     f'Current {limit_type}: {current_value:.2f}, max {limit_type}: {max_value:.2f}'
                 )
+                await self.set_agent_state_to(AgentState.ERROR)
             else:
-                await self.set_agent_state_to(AgentState.PAUSED)
                 await self.report_error(
                     f'Agent reached maximum {limit_type}, task paused. '
                     f'Current {limit_type}: {current_value:.2f}, max {limit_type}: {max_value:.2f}. '
                     f'{TRAFFIC_CONTROL_REMINDER}'
                 )
+                await self.set_agent_state_to(AgentState.PAUSED)
             stop_step = True
         return stop_step
 
